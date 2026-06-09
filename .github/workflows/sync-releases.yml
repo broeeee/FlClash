@@ -1,0 +1,158 @@
+name: Sync Releases from Upstream
+
+on:
+  schedule:
+    # Run every day at 08:00 UTC (16:00 Beijing Time)
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      sync_all:
+        description: 'Force re-sync all releases (overwrite existing)'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  sync-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync releases from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: chen08209/FlClash
+          TARGET_REPO: ${{ github.repository }}
+          SYNC_ALL: ${{ github.event.inputs.sync_all || 'false' }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Fetching upstream releases ==="
+          UPSTREAM_RELEASES=$(gh release list \
+            --repo "$UPSTREAM_REPO" \
+            --limit 50 \
+            --json tagName,isDraft \
+            | jq -r '.[] | select(.isDraft == false) | .tagName')
+
+          echo "Upstream releases found:"
+          echo "$UPSTREAM_RELEASES"
+
+          echo ""
+          echo "=== Fetching existing releases in $TARGET_REPO ==="
+          EXISTING_RELEASES=$(gh release list \
+            --repo "$TARGET_REPO" \
+            --limit 100 \
+            --json tagName \
+            | jq -r '.[].tagName' || echo "")
+
+          echo "Existing releases:"
+          echo "${EXISTING_RELEASES:-<none>}"
+
+          SYNCED=0
+          SKIPPED=0
+          FAILED=0
+
+          for TAG in $UPSTREAM_RELEASES; do
+            # Check if release already exists in target
+            if echo "$EXISTING_RELEASES" | grep -qx "$TAG"; then
+              if [ "$SYNC_ALL" != "true" ]; then
+                echo ""
+                echo "[SKIP] $TAG already exists in $TARGET_REPO"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+              else
+                echo ""
+                echo "[RESYNC] $TAG exists but SYNC_ALL=true, will re-sync"
+              fi
+            fi
+
+            echo ""
+            echo "=== Processing release: $TAG ==="
+
+            # Get full release info from upstream
+            RELEASE_INFO=$(gh release view "$TAG" \
+              --repo "$UPSTREAM_REPO" \
+              --json name,body,isPrerelease,tagName)
+            RELEASE_NAME=$(echo "$RELEASE_INFO" | jq -r '.name')
+            RELEASE_BODY=$(echo "$RELEASE_INFO" | jq -r '.body')
+            IS_PRERELEASE=$(echo "$RELEASE_INFO" | jq -r '.isPrerelease')
+
+            # Create temp directory for assets
+            TMPDIR=$(mktemp -d)
+            echo "Downloading assets to $TMPDIR ..."
+
+            # Download all assets from upstream
+            DOWNLOAD_OK=true
+            gh release download "$TAG" \
+              --repo "$UPSTREAM_REPO" \
+              --dir "$TMPDIR" \
+              --pattern '*' 2>&1 || DOWNLOAD_OK=false
+
+            ASSET_COUNT=$(ls "$TMPDIR" 2>/dev/null | wc -l)
+            echo "Downloaded $ASSET_COUNT asset(s)"
+
+            # Build prerelease flag
+            PRE_FLAG=""
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              PRE_FLAG="--prerelease"
+            fi
+
+            # If re-syncing, delete existing release and tag first
+            if echo "$EXISTING_RELEASES" | grep -qx "$TAG"; then
+              echo "Removing existing release $TAG ..."
+              gh release delete "$TAG" \
+                --repo "$TARGET_REPO" \
+                --yes \
+                --cleanup-tag 2>/dev/null || true
+              sleep 2
+            fi
+
+            # Create release in target repo
+            CREATE_OK=true
+            if [ "$ASSET_COUNT" -gt 0 ]; then
+              ASSET_FILES=$(ls "$TMPDIR"/*)
+              echo "Creating release $TAG with $ASSET_COUNT asset(s) ..."
+              # shellcheck disable=SC2086
+              gh release create "$TAG" \
+                --repo "$TARGET_REPO" \
+                --title "$RELEASE_NAME" \
+                --notes "$RELEASE_BODY" \
+                $PRE_FLAG \
+                $ASSET_FILES || CREATE_OK=false
+            else
+              echo "Creating release $TAG (no assets) ..."
+              gh release create "$TAG" \
+                --repo "$TARGET_REPO" \
+                --title "$RELEASE_NAME" \
+                --notes "$RELEASE_BODY" \
+                $PRE_FLAG || CREATE_OK=false
+            fi
+
+            rm -rf "$TMPDIR"
+
+            if [ "$CREATE_OK" = "true" ]; then
+              echo "[OK] Synced $TAG"
+              SYNCED=$((SYNCED + 1))
+            else
+              echo "[FAIL] Failed to sync $TAG"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          echo ""
+          echo "==============================="
+          echo "  Sync Summary"
+          echo "==============================="
+          echo "  Synced:  $SYNCED"
+          echo "  Skipped: $SKIPPED"
+          echo "  Failed:  $FAILED"
+          echo "==============================="
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "ERROR: $FAILED release(s) failed to sync"
+            exit 1
+          fi
